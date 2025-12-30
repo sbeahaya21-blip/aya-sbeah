@@ -66,6 +66,15 @@ async def extract(file: UploadFile = File(...)):
 
     if items:
         data["Items"] = items
+ start_time = time.time()
+result = {
+     "confidence": "1",
+     "data": data,
+     "dataConfidence": data_confidence
+     "predictionTime": prediction_time  # add the prediction time to the response
+    }
+ end_time = time.time()
+prediction_time = round(end_time - start_time, 3)  # זמן בשניות
 
     # ✅ document classification confidence (safe)
     document_confidence = 1
@@ -128,6 +137,7 @@ async def extract(file: UploadFile = File(...)):
     response = doc_client.analyze_document(request)
 
     ...
+
 
     result = {
         "confidence": "1",
