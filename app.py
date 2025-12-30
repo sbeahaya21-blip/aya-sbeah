@@ -115,9 +115,23 @@ if __name__ == "__main__":
 
     init_db()
     uvicorn.run(app, host="0.0.0.0", port=8080)
-    #aya
+    # aya
 #
 
 
 ##
+@app.post("/extract")
+async def extract(file: UploadFile = File(...)):
+    ...
 
+    # This is the line that makes the prediction call, use time.time() to measure the time it takes to get the response #######
+    response = doc_client.analyze_document(request)
+
+    ...
+
+    result = {
+        "confidence": "1",
+        "data": data,
+        "dataConfidence": data_confidence
+        "predictionTime": prediction_time  # add the prediction time to the response
+    }
