@@ -3,4 +3,8 @@ uvicorn
 oci
 python-multipart
 pytest
+pytest-cov
 httpx
+pytest
+pytest-cov
+pytest-html
