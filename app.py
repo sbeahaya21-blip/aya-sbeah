@@ -1,37 +1,55 @@
+import uvicorn
 import sqlite3
 from fastapi import FastAPI, UploadFile, File
 import oci
 import base64
 import json
 from fastapi import HTTPException
-from db_util import init_db, save_inv_extraction
+from db_util import init_db, save_inv_extraction, get_db
 import time
 from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
 
 
 app = FastAPI()
 
-# Load OCI config from ~/.oci/config
-config = oci.config.from_file()
-doc_client = oci.ai_document.AIServiceDocumentClient(config)
+
+
+# Lazy initialization for OCI client (allows testing with mocks)
+
+
+def get_doc_client():
+    """Get or create the OCI document client"""
+    if not hasattr(get_doc_client, '_client'):
+        config = oci.config.from_file()
+        get_doc_client._client = oci.ai_document.AIServiceDocumentClient(
+            config)
+    return get_doc_client._client
+
+
+doc_client = get_doc_client()
 
 
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
 
     # ---------- PDF VALIDATION ----------
-    is_pdf_content_type = file.content_type == "application/pdf"
-    is_pdf_filename = file.filename.lower().endswith(".pdf")
+    pdf_type = file.content_type == "application/pdf"
+    pdf_filename = file.filename.lower().endswith(".pdf")
 
-    if not (is_pdf_content_type or is_pdf_filename):
+    if not (pdf_type or pdf_filename):
         raise HTTPException(
             status_code=400,
             detail="Invalid document. Please upload a valid PDF invoice with high confidence."
         )
 
     # ---------- ENCODE DOCUMENT ----------
+
+    # Processes an uploaded PDF by encoding it to Base64 and submitting it to
+    # OCI AI Document for key-value extraction and document classification.
     pdf_bytes = await file.read()
-    encoded_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
+    encoded_pdf = base64.b64encode(pdf_bytes).decode(
+        "utf-8")  # Base64 encode PDF
 
     document = oci.ai_document.models.InlineDocumentDetails(data=encoded_pdf)
 
@@ -49,8 +67,9 @@ async def extract(file: UploadFile = File(...)):
 
     # ---------- CALL OCI SAFELY ----------
     try:
-        response = doc_client.analyze_document(request)
-    except Exception:
+        response = get_doc_client().analyze_document(request)
+    except Exception as e:
+        # Catch OCI service errors and other exceptions
         raise HTTPException(
             status_code=503,
             detail="The service is currently unavailable. Please try again later."
@@ -59,78 +78,115 @@ async def extract(file: UploadFile = File(...)):
     # ---------- DATA STRUCTURES ----------
     data = {}
     data_confidence = {}
-    all_items = []
+    single_item = {}
+    extracted_items = []
 
     # ---------- PARSE PAGES ----------
-    for page in response.data.pages:
-        if not page.document_fields:
-            continue
+    pages = []
+    if response and hasattr(response, 'data') and response.data:
+        if hasattr(response.data, 'pages') and response.data.pages:
+            pages = response.data.pages
 
-        for f in page.document_fields:
-            field_key = f.field_label.name if f.field_label and f.field_label.name else ""
-            field_value = f.field_value.text if f.field_value and f.field_value.text else ""
+    for page in pages:
+        if page and hasattr(page, 'document_fields') and page.document_fields:
+            for field in page.document_fields:
 
-            # ---------- DATE FORMAT ----------
-            if field_key == "InvoiceDate":
-                field_value = format_date_to_iso(field_value)
+                field_name = field.field_label.name if field.field_label and hasattr(
+                    field.field_label, 'name') and field.field_label.name else None
 
-            # ---------- NUMERIC / MONEY FIELDS ----------
-            if field_key in (
-                "InvoiceTotal",
-                "SubTotal",
-                "ShippingCost",
-                "Amount",
-                "UnitPrice",
-                "AmountDue"
-            ):
-                field_value = clean_amount(field_value)
+                # Handle both .text and .value attributes for field_value
+                field_value = None
+                if field.field_value:
+                    if hasattr(field.field_value, 'text') and field.field_value.text:
+                        field_value = field.field_value.text
+                    elif hasattr(field.field_value, 'value') and field.field_value.value is not None:
+                        field_value = field.field_value.value
 
-            # ---------- CONFIDENCE ----------
-            field_conf = f.field_label.confidence if f.field_label and f.field_label.confidence else 0.0
+                # Skip if field_name is None (field has no label)
+                if field_name is None:
+                    continue
 
-            # ---------- HANDLE ITEMS ----------
-            if field_key == "Items" and f.field_value:
-                # Some SDK versions expose .items and some expose ._items
-                items_list = getattr(f.field_value, "items", None)
-                if not items_list:
-                    items_list = getattr(f.field_value, "_items", [])
+                # ---------- DATE FORMAT ----------
+                if field_name == "InvoiceDate":
+                    field_value = format_date(field_value)
 
-                all_items = []
+                # ---------- NUMERIC / MONEY FIELDS ----------
+                if field_name in (
+                    "InvoiceTotal",
+                    "SubTotal",
+                    "ShippingCost",
+                    "Amount",
+                    "UnitPrice",
+                    "AmountDue"
+                ):
+                    field_value = amount_format(field_value)
 
-                for item in items_list:
-                    single_item = {}
+                # ---------- CONFIDENCE ----------
+                field_confidence = field.field_label.confidence if field.field_label and hasattr(
+                    field.field_label, 'confidence') and field.field_label.confidence is not None else 0.0
 
-                    sub_fields = getattr(item.field_value, "items", [])
-                    for sub in sub_fields:
-                        sub_key = sub.field_label.name if sub.field_label else ""
-                        sub_value = sub.field_value.text if sub.field_value and sub.field_value.text else ""
+                # ---------- HANDLE ITEMS ----------
+                if field_name == "Items" and field.field_value and hasattr(field.field_value, 'items'):
 
-                        # Clean numeric fields inside items
-                        if sub_key in ("Quantity", "UnitPrice", "Amount"):
-                            sub_value = clean_amount(sub_value)
+                    # Reset the list for this invoice/document (avoid accumulating items across pages)
+                    extracted_items = []
 
-                        single_item[sub_key] = sub_value
+                    for sub_field in field.field_value.items:
+                        if not sub_field or not hasattr(sub_field, 'field_value') or not sub_field.field_value:
+                            continue
+                        if not hasattr(sub_field.field_value, 'items'):
+                            continue
 
-                    all_items.append(single_item)
+                        single_item = {}
 
-                field_value = all_items
+                        for sub in sub_field.field_value.items:
+                            if not sub:
+                                continue
 
-            data[field_key] = field_value
-            data_confidence[field_key] = field_conf
+                            sub_key = sub.field_label.name if sub.field_label and hasattr(
+                                sub.field_label, 'name') and sub.field_label.name else ""
+
+                            # Handle both .text and .value attributes for sub items
+                            sub_value = ""
+                            if sub.field_value:
+                                if hasattr(sub.field_value, 'text') and sub.field_value.text:
+                                    sub_value = sub.field_value.text
+                                elif hasattr(sub.field_value, 'value') and sub.field_value.value is not None:
+                                    sub_value = sub.field_value.value
+
+                            # Clean numeric fields inside items
+                            if sub_key in ("Quantity", "UnitPrice", "Amount"):
+                                sub_value = amount_format(sub_value)
+
+                            if sub_key:
+                                single_item[sub_key] = sub_value
+
+                        extracted_items.append(single_item)
+
+                    field_value = extracted_items
+
+                if field_name:
+                    data[field_name] = field_value
+
+                    if field_name != "Items":
+                        data_confidence[field_name] = field_confidence
 
     # ---------- DOCUMENT VALIDATION ----------
-    if response.data.detected_document_types:
-        for doc_type in response.data.detected_document_types:
-            confid = doc_type.confidence
-            if confid < 0.9:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid document. Please upload a valid PDF invoice with high confidence."
-                )
+    confidence = None
+    if response and hasattr(response, 'data') and response.data:
+        if hasattr(response.data, 'detected_document_types') and response.data.detected_document_types:
+            for doc_type in response.data.detected_document_types:
+                if doc_type and hasattr(doc_type, 'confidence'):
+                    confidence = doc_type.confidence
+                    if confidence and confidence < 0.9:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Invalid document. Please upload a valid PDF invoice with high confidence."
+                        )
 
     # ---------- FINAL RESPONSE ----------
     result = {
-        "confidence": confid,
+        "confidence": confidence,
         "data": data,
         "dataConfidence": data_confidence,
     }
@@ -141,7 +197,7 @@ async def extract(file: UploadFile = File(...)):
 
 
 # ---------- HELPERS ----------
-def format_date_to_iso(date_text):
+def format_date(date_text):
     """
     Converts date like:
     'Mar 06 2012' → '2012-03-06T00:00:00+00:00'
@@ -155,7 +211,7 @@ def format_date_to_iso(date_text):
         return date_text
 
 
-def clean_amount(value):
+def amount_format(value):
     """
     Removes $ , and spaces → returns float
     '$58.11' → 58.11
@@ -174,7 +230,160 @@ def health():
     return {"status": "ok"}
 
 
-if _name_ == "_main_":
-    import uvicorn
+@app.get("/invoices/vendor/{vendor_name}")
+async def invoices_by_vendor(vendor_name: str) -> Dict[str, Any]:
+    """
+    Retrieve all invoices for a specific vendor.
+
+    Args:
+        vendor_name: The name of the vendor to filter invoices by.
+
+    Returns:
+        A dictionary containing:
+            - VendorName: The vendor name (or "Unknown Vendor" if no invoices found)
+            - TotalInvoices: The total number of invoices for this vendor
+            - invoices: A list of invoice dictionaries, each containing invoice details
+
+    Example:
+        GET /invoices/vendor/SuperStore
+        Returns:
+        {
+            "VendorName": "SuperStore",
+            "TotalInvoices": 5,
+            "invoices": [...]
+        }
+    """
+    invoices = get_invoices_by_vendor(vendor_name)
+
+    if not invoices:
+        return {
+            "VendorName": "Unknown Vendor",
+            "TotalInvoices": 0,
+            "invoices": []
+        }
+
+    return {
+        "VendorName": vendor_name,
+        "TotalInvoices": len(invoices),
+        "invoices": invoices
+    }
+
+
+def get_invoices_by_vendor(vendor_name: str) -> List[Dict[str, Any]]:
+    """
+    Fetch all invoices for a given vendor from the database.
+
+    This function queries the database for all invoice IDs associated with the
+    specified vendor, then retrieves the full invoice details for each ID.
+    Invoices are returned in ascending order by invoice date.
+
+    Args:
+        vendor_name: The name of the vendor to search for.
+
+    Returns:
+        A list of invoice dictionaries. Each dictionary contains the complete
+        invoice information including invoice ID, vendor name, date, addresses,
+        totals, and line items. Returns an empty list if no invoices are found
+        or if the vendor does not exist.
+
+    Example:
+        invoices = get_invoices_by_vendor("SuperStore")
+        # Returns: [{"InvoiceId": "36259", "VendorName": "SuperStore", ...}, ...]
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT InvoiceId
+            FROM invoices
+            WHERE VendorName = ?
+            ORDER BY InvoiceDate ASC
+        """, (vendor_name,))
+        invoice_ids = [r[0] for r in cursor.fetchall()]
+
+    invoices = []
+    for inv_id in invoice_ids:
+        inv = get_invoice_by_id(inv_id)
+        if inv:
+            invoices.append(inv)
+
+    return invoices
+
+
+@app.get("/invoices/{invoice_id}")
+def get_invoice_by_id(invoice_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve a complete invoice by its ID, including line items.
+
+    This function fetches the invoice header information from the invoices table
+    and all associated line items from the items table, combining them into
+    a single dictionary structure.
+
+    Args:
+        invoice_id: The unique identifier of the invoice to retrieve.
+
+    Returns:
+        A dictionary containing the complete invoice data including:
+            - InvoiceId, VendorName, InvoiceDate, BillingAddressRecipient,
+              ShippingAddress, SubTotal, ShippingCost, InvoiceTotal
+            - Items: A list of line item dictionaries
+        Returns None if the invoice ID is not found in the database.
+
+    Example:
+        invoice = get_invoice_by_id("36259")
+        # Returns: {"InvoiceId": "36259", "VendorName": "SuperStore", "Items": [...], ...}
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        # Get invoice header
+        cursor.execute("""
+            SELECT InvoiceId, VendorName, InvoiceDate, BillingAddressRecipient,
+                   ShippingAddress, SubTotal, ShippingCost, InvoiceTotal
+            FROM invoices
+            WHERE InvoiceId = ?
+        """, (invoice_id,))
+
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Invoice with ID '{invoice_id}' not found"
+            )
+
+        invoice = {
+            "InvoiceId": row[0],
+            "VendorName": row[1],
+            "InvoiceDate": row[2],
+            "BillingAddressRecipient": row[3],
+            "ShippingAddress": row[4],
+            "SubTotal": row[5],
+            "ShippingCost": row[6],
+            "InvoiceTotal": row[7]
+        }
+
+        # Get line items
+        cursor.execute("""
+            SELECT Description, Name, Quantity, UnitPrice, Amount
+            FROM items
+            WHERE InvoiceId = ?
+            ORDER BY id ASC
+        """, (invoice_id,))
+
+        items = []
+        for item_row in cursor.fetchall():
+            items.append({
+                "Description": item_row[0],
+                "Name": item_row[1],
+                "Quantity": item_row[2],
+                "UnitPrice": item_row[3],
+                "Amount": item_row[4]
+            })
+
+        invoice["Items"] = items
+        return invoice
+
+
+if __name__ == "__main__":
     init_db()
     uvicorn.run(app, host="0.0.0.0", port=8080)
