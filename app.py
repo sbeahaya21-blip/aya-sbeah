@@ -14,7 +14,6 @@ from typing import Dict, List, Optional, Any
 app = FastAPI()
 
 
-
 # Lazy initialization for OCI client (allows testing with mocks)
 
 
