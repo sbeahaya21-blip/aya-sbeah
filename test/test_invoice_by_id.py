@@ -12,10 +12,10 @@ class TestInvoiceByIdAPI(unittest.TestCase):
         """Set up test fixtures before each test method"""
         # Initialize database
         init_db()
-        
+
         # Import app
         with patch('oci.ai_document.AIServiceDocumentClient'), \
-             patch('oci.config.from_file', return_value={}):
+                patch('oci.config.from_file', return_value={}):
             from app import app
             self.client = TestClient(app)
 
@@ -25,8 +25,10 @@ class TestInvoiceByIdAPI(unittest.TestCase):
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM items WHERE InvoiceId LIKE 'TEST_%'")
-            cursor.execute("DELETE FROM confidences WHERE InvoiceId LIKE 'TEST_%'")
-            cursor.execute("DELETE FROM invoices WHERE InvoiceId LIKE 'TEST_%'")
+            cursor.execute(
+                "DELETE FROM confidences WHERE InvoiceId LIKE 'TEST_%'")
+            cursor.execute(
+                "DELETE FROM invoices WHERE InvoiceId LIKE 'TEST_%'")
 
     def test_get_invoice_by_id_success(self):
         """Test successful retrieval of invoice by ID"""
@@ -67,10 +69,10 @@ class TestInvoiceByIdAPI(unittest.TestCase):
 
         # Test GET endpoint
         with patch('oci.ai_document.AIServiceDocumentClient'), \
-             patch('oci.config.from_file', return_value={}):
+                patch('oci.config.from_file', return_value={}):
             from app import app
             client = TestClient(app)
-            
+
             response = client.get(f"/invoices/{test_invoice_id}")
 
             self.assertEqual(response.status_code, 200)
@@ -79,8 +81,10 @@ class TestInvoiceByIdAPI(unittest.TestCase):
             # Validate response structure
             self.assertEqual(result["InvoiceId"], test_invoice_id)
             self.assertEqual(result["VendorName"], "TestVendor")
-            self.assertEqual(result["InvoiceDate"], "2012-03-06T00:00:00+00:00")
-            self.assertEqual(result["BillingAddressRecipient"], "Test Recipient")
+            self.assertEqual(result["InvoiceDate"],
+                             "2012-03-06T00:00:00+00:00")
+            self.assertEqual(
+                result["BillingAddressRecipient"], "Test Recipient")
             self.assertEqual(result["ShippingAddress"], "123 Test St")
             self.assertEqual(result["SubTotal"], 100.0)
             self.assertEqual(result["ShippingCost"], 10.0)
@@ -92,10 +96,10 @@ class TestInvoiceByIdAPI(unittest.TestCase):
     def test_get_invoice_by_id_not_found(self):
         """Test retrieval of non-existent invoice ID"""
         with patch('oci.ai_document.AIServiceDocumentClient'), \
-             patch('oci.config.from_file', return_value={}):
+                patch('oci.config.from_file', return_value={}):
             from app import app
             client = TestClient(app)
-            
+
             response = client.get("/invoices/NONEXISTENT_99999")
 
             self.assertEqual(response.status_code, 404)
@@ -144,10 +148,10 @@ class TestInvoiceByIdAPI(unittest.TestCase):
         save_inv_extraction(test_data)
 
         with patch('oci.ai_document.AIServiceDocumentClient'), \
-             patch('oci.config.from_file', return_value={}):
+                patch('oci.config.from_file', return_value={}):
             from app import app
             client = TestClient(app)
-            
+
             response = client.get(f"/invoices/{test_invoice_id}")
 
             self.assertEqual(response.status_code, 200)
@@ -185,10 +189,10 @@ class TestInvoiceByIdAPI(unittest.TestCase):
         save_inv_extraction(test_data)
 
         with patch('oci.ai_document.AIServiceDocumentClient'), \
-             patch('oci.config.from_file', return_value={}):
+                patch('oci.config.from_file', return_value={}):
             from app import app
             client = TestClient(app)
-            
+
             response = client.get(f"/invoices/{test_invoice_id}")
 
             self.assertEqual(response.status_code, 200)
@@ -200,7 +204,7 @@ class TestInvoiceByIdAPI(unittest.TestCase):
     def test_get_invoice_by_id_null_values(self):
         """Test retrieval of invoice with null/None values"""
         test_invoice_id = "TEST_NULL_123"
-        
+
         # Insert invoice directly with some null values
         with get_db() as conn:
             cursor = conn.cursor()
@@ -221,10 +225,10 @@ class TestInvoiceByIdAPI(unittest.TestCase):
             ))
 
         with patch('oci.ai_document.AIServiceDocumentClient'), \
-             patch('oci.config.from_file', return_value={}):
+                patch('oci.config.from_file', return_value={}):
             from app import app
             client = TestClient(app)
-            
+
             response = client.get(f"/invoices/{test_invoice_id}")
 
             self.assertEqual(response.status_code, 200)
@@ -262,10 +266,10 @@ class TestInvoiceByIdAPI(unittest.TestCase):
         save_inv_extraction(test_data)
 
         with patch('oci.ai_document.AIServiceDocumentClient'), \
-             patch('oci.config.from_file', return_value={}):
+                patch('oci.config.from_file', return_value={}):
             from app import app
             client = TestClient(app)
-            
+
             response = client.get(f"/invoices/{test_invoice_id}")
 
             self.assertEqual(response.status_code, 200)
@@ -275,10 +279,10 @@ class TestInvoiceByIdAPI(unittest.TestCase):
     def test_get_invoice_by_id_empty_string(self):
         """Test retrieval with empty string invoice ID"""
         with patch('oci.ai_document.AIServiceDocumentClient'), \
-             patch('oci.config.from_file', return_value={}):
+                patch('oci.config.from_file', return_value={}):
             from app import app
             client = TestClient(app)
-            
+
             response = client.get("/invoices/")
 
             # FastAPI should return 404 for empty path
@@ -287,7 +291,7 @@ class TestInvoiceByIdAPI(unittest.TestCase):
     def test_get_invoice_by_id_items_ordered(self):
         """Test that items are returned in correct order"""
         test_invoice_id = "TEST_ORDERED_123"
-        
+
         # Insert invoice and items directly to control order
         with get_db() as conn:
             cursor = conn.cursor()
@@ -306,7 +310,7 @@ class TestInvoiceByIdAPI(unittest.TestCase):
                 10.0,
                 310.0
             ))
-            
+
             # Insert items in specific order
             items = [
                 ("Item A", "Product A", 1, 100.0, 100.0),
@@ -320,10 +324,10 @@ class TestInvoiceByIdAPI(unittest.TestCase):
                 """, (test_invoice_id, *item))
 
         with patch('oci.ai_document.AIServiceDocumentClient'), \
-             patch('oci.config.from_file', return_value={}):
+                patch('oci.config.from_file', return_value={}):
             from app import app
             client = TestClient(app)
-            
+
             response = client.get(f"/invoices/{test_invoice_id}")
 
             self.assertEqual(response.status_code, 200)
@@ -369,10 +373,10 @@ class TestInvoiceByIdAPI(unittest.TestCase):
         save_inv_extraction(test_data)
 
         with patch('oci.ai_document.AIServiceDocumentClient'), \
-             patch('oci.config.from_file', return_value={}):
+                patch('oci.config.from_file', return_value={}):
             from app import app
             client = TestClient(app)
-            
+
             response = client.get(f"/invoices/{test_invoice_id}")
 
             self.assertEqual(response.status_code, 200)
@@ -386,4 +390,3 @@ class TestInvoiceByIdAPI(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-
