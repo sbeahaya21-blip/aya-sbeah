@@ -5,7 +5,7 @@ import base64
 import json
 from fastapi import HTTPException
 from db_util import init_db, save_inv_extraction
-from controllers.invoice_controller import InvoiceController
+from controllers.invoice_controller import InvoiceController #MVC
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 
@@ -117,7 +117,7 @@ async def extract(file: UploadFile = File(...)):
                     "UnitPrice",
                     "AmountDue"
                 ):
-                    field_value = amount_format(field_value)
+                    field_value = amount_format(field_value) #from $1,200.5 -> 1200.5
 
                 # ---------- CONFIDENCE ----------
                 field_confidence = field.field_label.confidence if field.field_label and hasattr(
@@ -129,11 +129,11 @@ async def extract(file: UploadFile = File(...)):
                     # Reset the list for this invoice/document (avoid accumulating items across pages)
                     extracted_items = []
 
-                    for sub_field in field.field_value.items:
+                    for sub_field in field.field_value.items: #if field_value has items, iterate through them
                         if not sub_field or not hasattr(sub_field, 'field_value') or not sub_field.field_value:
-                            continue
+                            continue #if sub_field is None or doesn't have a field_value, skip
                         if not hasattr(sub_field.field_value, 'items'):
-                            continue
+                            continue #if sub_field.field_value doesn't have items, skip
 
                         single_item = {}
 
@@ -142,22 +142,22 @@ async def extract(file: UploadFile = File(...)):
                                 continue
 
                             sub_key = sub.field_label.name if sub.field_label and hasattr(
-                                sub.field_label, 'name') and sub.field_label.name else ""
+                                sub.field_label, 'name') and sub.field_label.name else "" #check the name of the sub field
 
                             # Handle both .text and .value attributes for sub items
                             sub_value = ""
                             if sub.field_value:
                                 if hasattr(sub.field_value, 'text') and sub.field_value.text:
-                                    sub_value = sub.field_value.text
+                                    sub_value = sub.field_value.text #check the text of the sub field
                                 elif hasattr(sub.field_value, 'value') and sub.field_value.value is not None:
-                                    sub_value = sub.field_value.value
+                                    sub_value = sub.field_value.value #check the value of the sub field
 
                             # Clean numeric fields inside items
                             if sub_key in ("Quantity", "UnitPrice", "Amount"):
-                                sub_value = amount_format(sub_value)
+                                sub_value = amount_format(sub_value) #from $1,200.5 -> 1200.5
 
                             if sub_key:
-                                single_item[sub_key] = sub_value
+                                single_item[sub_key] = sub_value #add the value to dictionary
 
                         extracted_items.append(single_item)
 
