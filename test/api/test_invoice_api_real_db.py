@@ -2,7 +2,8 @@ import unittest
 import os
 from unittest.mock import patch
 from fastapi.testclient import TestClient
-from db_util import init_db, save_inv_extraction, get_db, get_cursor
+from db import init_db, get_db, SessionLocal
+from db_util import save_inv_extraction
 from controllers.invoice_controller import InvoiceController
 from models.invoice import Invoice
 from models.item import Item
@@ -15,8 +16,15 @@ class TestInvoiceAPIRealDB(unittest.TestCase):
         """Set up test fixtures before each test method"""
         # Set DB_BACKEND to sqlite for tests
         os.environ['DB_BACKEND'] = 'sqlite'
-        # Initialize database
-        init_db()
+        # Use shared in-memory database for tests (allows multiple connections)
+        self.test_engine = init_db("sqlite:///:memory:?cache=shared")
+        
+        # Capture the test database SessionLocal before app import
+        # Re-import to ensure we get the updated SessionLocal after init_db()
+        from db import SessionLocal as UpdatedSessionLocal
+        self.test_session_local = UpdatedSessionLocal
+        assert self.test_session_local is not None, "SessionLocal must be initialized"
+        assert self.test_engine is not None, "Engine must be initialized"
 
         # Mock OCI client to avoid actual API calls
         self.oci_patcher = patch('oci.ai_document.AIServiceDocumentClient')
@@ -27,7 +35,42 @@ class TestInvoiceAPIRealDB(unittest.TestCase):
         # Import app - NO mocking of OCI client needed for these tests
         # as we're only testing the database and API endpoints
         from app import app
+        
+        # Create a test-specific get_db function that uses the test database
+        def get_test_db():
+            db = self.test_session_local()
+            try:
+                yield db
+            finally:
+                db.close()
+        
+        app.dependency_overrides[get_db] = get_test_db
         self.client = TestClient(app)
+
+    def _setup_app_dependency_override(self, app):
+        """Helper method to set up dependency override for test database"""
+        # Ensure we have a valid SessionLocal and tables are created
+        if self.test_session_local is None or self.test_engine is None:
+            self.test_engine = init_db("sqlite:///:memory:?cache=shared")
+            from db import SessionLocal as UpdatedSessionLocal
+            self.test_session_local = UpdatedSessionLocal
+        
+        # Ensure tables exist for the test database
+        # Create tables using the engine bound to this sessionmaker
+        from db import Base
+        # Use the stored engine directly - it's bound to our sessionmaker
+        Base.metadata.create_all(bind=self.test_engine)
+        
+        # Note: TestClient(app) without context manager doesn't run startup events
+        # But we ensure tables exist anyway in case startup does run
+        
+        def get_test_db():
+            db = self.test_session_local()
+            try:
+                yield db
+            finally:
+                db.close()
+        app.dependency_overrides[get_db] = get_test_db
 
     def tearDown(self):
         """Clean up after each test"""
@@ -35,25 +78,26 @@ class TestInvoiceAPIRealDB(unittest.TestCase):
         self.oci_patcher.stop()
         self.config_patcher.stop()
 
-        # Clean up test data using controller
-        controller = InvoiceController()
-        # Get all invoice IDs that start with REAL_DB_TEST_
-        with get_db() as conn:
-            cursor = get_cursor(conn)
-            if os.getenv('DB_BACKEND', 'sqlite').lower() == 'postgresql':
-                cursor.execute(
-                    "SELECT InvoiceId FROM invoices WHERE InvoiceId LIKE 'REAL_DB_TEST_%'")
-                rows = cursor.fetchall()
-                invoice_ids = [row['InvoiceId'] for row in rows]
-            else:
-                cursor.execute(
-                    "SELECT InvoiceId FROM invoices WHERE InvoiceId LIKE 'REAL_DB_TEST_%'")
-                rows = cursor.fetchall()
-                invoice_ids = [row[0] for row in rows]
+        # Clear dependency overrides
+        from app import app
+        app.dependency_overrides.clear()
 
-        # Delete each test invoice using controller
-        for invoice_id in invoice_ids:
-            controller.delete_invoice(invoice_id)
+        # Clean up test data using SQLAlchemy (use test database directly)
+        db = self.test_session_local()
+        try:
+            from models.invoice import Invoice
+            test_invoices = db.query(Invoice).filter(
+                Invoice.invoice_id.like('REAL_DB_TEST_%')
+            ).all()
+            invoice_ids = [inv.invoice_id for inv in test_invoices]
+
+            # Delete each test invoice using controller
+            controller = InvoiceController()
+            for invoice_id in invoice_ids:
+                controller.delete_invoice(invoice_id, db)
+            db.commit()
+        finally:
+            db.close()
 
     def test_get_invoice_by_id_real_db(self):
         """Test invoice retrieval by ID using real database"""
@@ -90,8 +134,13 @@ class TestInvoiceAPIRealDB(unittest.TestCase):
             }
         }
 
-        # Save to real database
-        save_inv_extraction(test_data)
+        # Save to real database (use test database directly)
+        db = self.test_session_local()
+        try:
+            save_inv_extraction(test_data, db)
+            db.commit()
+        finally:
+            db.close()
 
         # Test GET endpoint
         response = self.client.get(f"/invoices/{test_invoice_id}")
@@ -157,9 +206,14 @@ class TestInvoiceAPIRealDB(unittest.TestCase):
             "dataConfidence": {}
         }
 
-        # Save to real database
-        save_inv_extraction(test_data_1)
-        save_inv_extraction(test_data_2)
+        # Save to real database (use test database directly)
+        db = self.test_session_local()
+        try:
+            save_inv_extraction(test_data_1, db)
+            save_inv_extraction(test_data_2, db)
+            db.commit()
+        finally:
+            db.close()
 
         # Test GET endpoint
         response = self.client.get(f"/invoices/vendor/{vendor_name}")
@@ -231,8 +285,13 @@ class TestInvoiceAPIRealDB(unittest.TestCase):
             }
         }
 
-        # Save to real database
-        save_inv_extraction(test_data)
+        # Save to real database (use test database directly)
+        db = self.test_session_local()
+        try:
+            save_inv_extraction(test_data, db)
+            db.commit()
+        finally:
+            db.close()
 
         # Test GET endpoint
         response = self.client.get(f"/invoices/{test_invoice_id}")
@@ -281,14 +340,23 @@ class TestInvoiceAPIRealDB(unittest.TestCase):
             }
         }
 
-        # Save to real database
-        save_inv_extraction(test_data)
+        # Save to real database (use test database directly)
+        db = self.test_session_local()
+        try:
+            save_inv_extraction(test_data, db)
+            db.commit()
+        finally:
+            db.close()
 
-        # Verify data was saved using controller
-        controller = InvoiceController()
-        invoice = controller.get_invoice_by_id(test_invoice_id)
+        # Verify data was saved using controller (use test database directly)
+        db = self.test_session_local()
+        try:
+            controller = InvoiceController()
+            invoice = controller.get_invoice_by_id(test_invoice_id, db)
 
-        self.assertIsNotNone(invoice)
+            self.assertIsNotNone(invoice)
+        finally:
+            db.close()
         self.assertEqual(invoice.invoice_id, test_invoice_id)
         self.assertEqual(invoice.vendor_name, "PersistenceTestVendor")
         self.assertEqual(invoice.invoice_total, 275.0)
@@ -353,10 +421,15 @@ class TestInvoiceAPIRealDB(unittest.TestCase):
             "dataConfidence": {}
         }
 
-        # Insert in non-chronological order
-        save_inv_extraction(test_data_3)
-        save_inv_extraction(test_data_1)
-        save_inv_extraction(test_data_2)
+        # Insert in non-chronological order (use test database directly)
+        db = self.test_session_local()
+        try:
+            save_inv_extraction(test_data_3, db)
+            save_inv_extraction(test_data_1, db)
+            save_inv_extraction(test_data_2, db)
+            db.commit()
+        finally:
+            db.close()
 
         # Test GET endpoint
         response = self.client.get(f"/invoices/vendor/{vendor_name}")
@@ -377,37 +450,42 @@ class TestInvoiceAPIRealDB(unittest.TestCase):
         """Test that invoice items are returned in correct order using real database"""
         test_invoice_id = "REAL_DB_TEST_ITEMS_ORDER_001"
 
-        # Create invoice and items using controller
-        controller = InvoiceController()
-        invoice = Invoice(
-            invoice_id=test_invoice_id,
-            vendor_name="RealDBItemsOrderVendor",
-            invoice_date="2012-03-06T00:00:00+00:00",
-            billing_address_recipient="Test Recipient",
-            shipping_address="123 Test St",
-            sub_total=500.0,
-            shipping_cost=50.0,
-            invoice_total=550.0
-        )
-        controller.create_or_update_invoice(invoice)
-
-        # Insert items in specific order using controller
-        items_data = [
-            {"Description": "Item A", "Name": "Product A",
-                "Quantity": 1, "UnitPrice": 200.0, "Amount": 200.0},
-            {"Description": "Item B", "Name": "Product B",
-                "Quantity": 2, "UnitPrice": 150.0, "Amount": 300.0},
-        ]
-        for item_data in items_data:
-            item = Item(
+        # Create invoice and items using controller (use test database directly)
+        db = self.test_session_local()
+        try:
+            controller = InvoiceController()
+            invoice = Invoice(
                 invoice_id=test_invoice_id,
-                description=item_data["Description"],
-                name=item_data["Name"],
-                quantity=item_data["Quantity"],
-                unit_price=item_data["UnitPrice"],
-                amount=item_data["Amount"]
+                vendor_name="RealDBItemsOrderVendor",
+                invoice_date="2012-03-06T00:00:00+00:00",
+                billing_address_recipient="Test Recipient",
+                shipping_address="123 Test St",
+                sub_total=500.0,
+                shipping_cost=50.0,
+                invoice_total=550.0
             )
-            controller.create_item(item)
+            controller.create_or_update_invoice(invoice, db)
+
+            # Insert items in specific order using controller
+            items_data = [
+                {"Description": "Item A", "Name": "Product A",
+                    "Quantity": 1, "UnitPrice": 200.0, "Amount": 200.0},
+                {"Description": "Item B", "Name": "Product B",
+                    "Quantity": 2, "UnitPrice": 150.0, "Amount": 300.0},
+            ]
+            for item_data in items_data:
+                item = Item(
+                    invoice_id=test_invoice_id,
+                    description=item_data["Description"],
+                    name=item_data["Name"],
+                    quantity=item_data["Quantity"],
+                    unit_price=item_data["UnitPrice"],
+                    amount=item_data["Amount"]
+                )
+                controller.create_item(item, db)
+            db.commit()
+        finally:
+            db.close()
 
         # Test GET endpoint
         response = self.client.get(f"/invoices/{test_invoice_id}")

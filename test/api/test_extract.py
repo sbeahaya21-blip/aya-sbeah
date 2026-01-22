@@ -1,7 +1,7 @@
 import unittest
 import os
 from unittest.mock import patch, MagicMock
-from db_util import init_db, get_db, get_cursor
+from db import init_db, get_db, SessionLocal
 from controllers.invoice_controller import InvoiceController
 
 
@@ -12,8 +12,15 @@ class TestInvoiceExtraction(unittest.TestCase):
         """Set up test fixtures before each test method"""
         # Set DB_BACKEND to sqlite for tests
         os.environ['DB_BACKEND'] = 'sqlite'
-        # Initialize database
-        init_db()
+        # Use shared in-memory database for tests (allows multiple connections)
+        self.test_engine = init_db("sqlite:///:memory:?cache=shared")
+        
+        # Capture the test database SessionLocal before app import
+        # Re-import to ensure we get the updated SessionLocal after init_db()
+        from db import SessionLocal as UpdatedSessionLocal
+        self.test_session_local = UpdatedSessionLocal
+        assert self.test_session_local is not None, "SessionLocal must be initialized"
+        assert self.test_engine is not None, "Engine must be initialized"
 
         # Mock OCI client - setup mock instance
         self.mock_client_instance = MagicMock()
@@ -23,31 +30,70 @@ class TestInvoiceExtraction(unittest.TestCase):
         self.oci_patcher.start()
         self.config_patcher.start()
 
+        # Import app and override get_db dependency to use test database
+        from app import app
+        
+        # Create a test-specific get_db function that uses the test database
+        def get_test_db():
+            db = self.test_session_local()
+            try:
+                yield db
+            finally:
+                db.close()
+        
+        app.dependency_overrides[get_db] = get_test_db
+
+    def _setup_app_dependency_override(self, app):
+        """Helper method to set up dependency override for test database"""
+        # Ensure we have a valid SessionLocal and tables are created
+        if self.test_session_local is None or self.test_engine is None:
+            self.test_engine = init_db("sqlite:///:memory:?cache=shared")
+            from db import SessionLocal as UpdatedSessionLocal
+            self.test_session_local = UpdatedSessionLocal
+        
+        # Ensure tables exist for the test database
+        # Create tables using the engine bound to this sessionmaker
+        from db import Base
+        # Use the stored engine directly - it's bound to our sessionmaker
+        Base.metadata.create_all(bind=self.test_engine)
+        
+        # Note: TestClient(app) without context manager doesn't run startup events
+        # But we ensure tables exist anyway in case startup does run
+        
+        def get_test_db():
+            db = self.test_session_local()
+            try:
+                yield db
+            finally:
+                db.close()
+        app.dependency_overrides[get_db] = get_test_db
+
     def tearDown(self):
         """Clean up after each test"""
         # Stop OCI patches
         self.oci_patcher.stop()
         self.config_patcher.stop()
 
-        # Clean up test data using controller
-        controller = InvoiceController()
-        # Get all invoice IDs that start with test patterns
-        with get_db() as conn:
-            cursor = get_cursor(conn)
-            if os.getenv('DB_BACKEND', 'sqlite').lower() == 'postgresql':
-                cursor.execute(
-                    "SELECT InvoiceId FROM invoices WHERE InvoiceId IN ('36259')")
-                rows = cursor.fetchall()
-                invoice_ids = [row['InvoiceId'] for row in rows]
-            else:
-                cursor.execute(
-                    "SELECT InvoiceId FROM invoices WHERE InvoiceId IN ('36259')")
-                rows = cursor.fetchall()
-                invoice_ids = [row[0] for row in rows]
+        # Clear dependency overrides
+        from app import app
+        app.dependency_overrides.clear()
 
-        # Delete test invoice using controller
-        for invoice_id in invoice_ids:
-            controller.delete_invoice(invoice_id)
+        # Clean up test data using SQLAlchemy (use test database directly)
+        db = self.test_session_local()
+        try:
+            from models.invoice import Invoice
+            test_invoices = db.query(Invoice).filter(
+                Invoice.invoice_id.in_(['36259'])
+            ).all()
+            invoice_ids = [inv.invoice_id for inv in test_invoices]
+
+            # Delete test invoice using controller
+            controller = InvoiceController()
+            for invoice_id in invoice_ids:
+                controller.delete_invoice(invoice_id, db)
+            db.commit()
+        finally:
+            db.close()
 
     def test_extract_endpoint(self):
         """Test the /extract endpoint with invoice_Aaron_Bergman_36259.pdf"""
@@ -162,6 +208,7 @@ class TestInvoiceExtraction(unittest.TestCase):
         import json
 
         # Create test client
+        self._setup_app_dependency_override(app)
         client = TestClient(app)
 
         # Load the test invoice file
@@ -212,6 +259,7 @@ class TestInvoiceExtraction(unittest.TestCase):
         from app import app
         from fastapi.testclient import TestClient
 
+        self._setup_app_dependency_override(app)
         client = TestClient(app)
 
         # Upload a text file instead of PDF
@@ -264,6 +312,7 @@ class TestInvoiceExtraction(unittest.TestCase):
         from app import app
         from fastapi.testclient import TestClient
 
+        self._setup_app_dependency_override(app)
         client = TestClient(app)
         response = client.get("/health")
 

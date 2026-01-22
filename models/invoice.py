@@ -1,20 +1,26 @@
-"""Invoice model and database operations"""
-from typing import Optional, Dict, Any, List
-from dataclasses import dataclass
-from datetime import datetime
+"""Invoice model using SQLAlchemy ORM"""
+from typing import Optional, Dict, Any
+from sqlalchemy import Column, String, Float, ForeignKey
+from sqlalchemy.orm import relationship
+from db import Base
 
 
-@dataclass
-class Invoice:
-    """Invoice data model"""
-    invoice_id: str
-    vendor_name: Optional[str] = None
-    invoice_date: Optional[str] = None
-    billing_address_recipient: Optional[str] = None
-    shipping_address: Optional[str] = None
-    sub_total: Optional[float] = None
-    shipping_cost: Optional[float] = None
-    invoice_total: Optional[float] = None
+class Invoice(Base):
+    """Invoice SQLAlchemy ORM model"""
+    __tablename__ = "invoices"
+
+    invoice_id = Column("InvoiceId", String, primary_key=True)
+    vendor_name = Column("VendorName", String, nullable=True)
+    invoice_date = Column("InvoiceDate", String, nullable=True)
+    billing_address_recipient = Column("BillingAddressRecipient", String, nullable=True)
+    shipping_address = Column("ShippingAddress", String, nullable=True)
+    sub_total = Column("SubTotal", Float, nullable=True)
+    shipping_cost = Column("ShippingCost", Float, nullable=True)
+    invoice_total = Column("InvoiceTotal", Float, nullable=True)
+
+    # Relationships
+    confidences = relationship("InvoiceConfidence", back_populates="invoice", cascade="all, delete-orphan")
+    items = relationship("Item", back_populates="invoice", cascade="all, delete-orphan")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert invoice to dictionary"""
@@ -44,17 +50,21 @@ class Invoice:
         )
 
 
-@dataclass
-class InvoiceConfidence:
-    """Invoice confidence scores model"""
-    invoice_id: str
-    vendor_name: Optional[float] = None
-    invoice_date: Optional[float] = None
-    billing_address_recipient: Optional[float] = None
-    shipping_address: Optional[float] = None
-    sub_total: Optional[float] = None
-    shipping_cost: Optional[float] = None
-    invoice_total: Optional[float] = None
+class InvoiceConfidence(Base):
+    """Invoice confidence scores SQLAlchemy ORM model"""
+    __tablename__ = "confidences"
+
+    invoice_id = Column("InvoiceId", String, ForeignKey("invoices.InvoiceId"), primary_key=True)
+    vendor_name = Column("VendorName", Float, nullable=True)
+    invoice_date = Column("InvoiceDate", Float, nullable=True)
+    billing_address_recipient = Column("BillingAddressRecipient", Float, nullable=True)
+    shipping_address = Column("ShippingAddress", Float, nullable=True)
+    sub_total = Column("SubTotal", Float, nullable=True)
+    shipping_cost = Column("ShippingCost", Float, nullable=True)
+    invoice_total = Column("InvoiceTotal", Float, nullable=True)
+
+    # Relationship
+    invoice = relationship("Invoice", back_populates="confidences")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert confidence to dictionary"""
@@ -81,4 +91,3 @@ class InvoiceConfidence:
             shipping_cost=data.get("ShippingCost"),
             invoice_total=data.get("InvoiceTotal")
         )
-

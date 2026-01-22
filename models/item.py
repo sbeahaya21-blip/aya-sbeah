@@ -1,18 +1,24 @@
-"""Item model and database operations"""
+"""Item model using SQLAlchemy ORM"""
 from typing import Optional, Dict, Any
-from dataclasses import dataclass
+from sqlalchemy import Column, Integer, String, Float, ForeignKey
+from sqlalchemy.orm import relationship
+from db import Base
 
 
-@dataclass
-class Item:
-    """Invoice line item data model"""
-    invoice_id: str
-    description: Optional[str] = None
-    name: Optional[str] = None
-    quantity: Optional[float] = None
-    unit_price: Optional[float] = None
-    amount: Optional[float] = None
-    id: Optional[int] = None  # Database primary key
+class Item(Base):
+    """Invoice line item SQLAlchemy ORM model"""
+    __tablename__ = "items"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    invoice_id = Column("InvoiceId", String, ForeignKey("invoices.InvoiceId"), nullable=False)
+    description = Column("Description", String, nullable=True)
+    name = Column("Name", String, nullable=True)
+    quantity = Column("Quantity", Float, nullable=True)
+    unit_price = Column("UnitPrice", Float, nullable=True)
+    amount = Column("Amount", Float, nullable=True)
+
+    # Relationship
+    invoice = relationship("Invoice", back_populates="items")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert item to dictionary"""
@@ -36,4 +42,3 @@ class Item:
             amount=data.get("Amount"),
             id=item_id
         )
-

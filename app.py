@@ -1,31 +1,65 @@
 import uvicorn
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Depends
+from sqlalchemy.orm import Session
 import oci
 import base64
 import json
 from fastapi import HTTPException
-from db_util import init_db, save_inv_extraction
-from controllers.invoice_controller import InvoiceController #MVC
+from contextlib import asynccontextmanager
+from db import init_db, get_db, init_multi_db, get_db_by_name, list_databases
+from services.invoice_service import save_inv_extraction
+from controllers.invoice_controller import InvoiceController
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
+import os
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan event handler for startup and shutdown"""
+    # Startup: Initialize database(s)
+    # Check if multiple databases are configured
+    secondary_databases = {}
+    
+    # Check for additional database URLs in environment
+    # Format: DB_NAME_URL=connection_string (e.g., ANALYTICS_DB_URL=postgresql://...)
+    for env_var in os.environ:
+        if env_var.endswith('_DB_URL') and env_var != 'DATABASE_URL':
+            db_name = env_var.replace('_DB_URL', '').lower()
+            db_url = os.environ[env_var]
+            secondary_databases[db_name] = db_url
+    
+    if secondary_databases:
+        # Initialize multiple databases
+        primary_url = os.getenv("DATABASE_URL")
+        init_multi_db(primary_db_url=primary_url, **secondary_databases)
+    else:
+        # Use single database (default behavior)
+        init_db()
+    
+    yield
+    # Shutdown: Add any cleanup code here if needed
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 # Lazy initialization for OCI client (allows testing with mocks)
 
 
 def get_doc_client():
-    """Get or create the OCI document client"""
+    """Get or create the OCI document client (lazy initialization)"""
     if not hasattr(get_doc_client, '_client'):
-        config = oci.config.from_file()
-        get_doc_client._client = oci.ai_document.AIServiceDocumentClient(
-            config)
+        try:
+            config = oci.config.from_file()
+            get_doc_client._client = oci.ai_document.AIServiceDocumentClient(
+                config)
+        except (oci.exceptions.ConfigFileNotFound, oci.exceptions.InvalidKeyFilePath) as e:
+            raise HTTPException(
+                status_code=503,
+                detail=f"OCI configuration error: {str(e)}"
+            )
     return get_doc_client._client
-
-
-doc_client = get_doc_client()
 
 
 @app.post("/extract")
@@ -66,6 +100,9 @@ async def extract(file: UploadFile = File(...)):
     # ---------- CALL OCI SAFELY ----------
     try:
         response = get_doc_client().analyze_document(request)
+    except HTTPException:
+        # Re-raise HTTPException (like ConfigFileNotFound, InvalidKeyFilePath)
+        raise
     except Exception as e:
         # Catch OCI service errors and other exceptions
         raise HTTPException(
@@ -189,7 +226,22 @@ async def extract(file: UploadFile = File(...)):
         "dataConfidence": data_confidence,
     }
 
-    save_inv_extraction(result)
+    # Save to database using service layer
+    # Create a database session for saving
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        save_inv_extraction(result, db)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database error: {str(e)}"
+        )
+    finally:
+        db.close()
 
     return result
 
@@ -229,7 +281,7 @@ def health():
 
 
 @app.get("/invoices/vendor/{vendor_name}")
-async def invoices_by_vendor(vendor_name: str) -> Dict[str, Any]:
+async def invoices_by_vendor(vendor_name: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
     """
     Retrieve all invoices for a specific vendor.
 
@@ -251,7 +303,18 @@ async def invoices_by_vendor(vendor_name: str) -> Dict[str, Any]:
             "invoices": [...]
         }
     """
-    invoices = get_invoices_by_vendor(vendor_name)
+    controller = InvoiceController()
+    invoice_ids = controller.get_invoices_by_vendor(vendor_name, db)
+
+    invoices = []
+    for inv_id in invoice_ids:
+        invoice = controller.get_invoice_by_id(inv_id, db)
+        if invoice:
+            invoice_dict = invoice.to_dict()
+            # Get items for this invoice
+            items = controller.get_items_by_invoice_id(inv_id, db)
+            invoice_dict["Items"] = [item.to_dict() for item in items]
+            invoices.append(invoice_dict)
 
     if not invoices:
         return {
@@ -267,45 +330,8 @@ async def invoices_by_vendor(vendor_name: str) -> Dict[str, Any]:
     }
 
 
-def get_invoices_by_vendor(vendor_name: str) -> List[Dict[str, Any]]:
-    """
-    Fetch all invoices for a given vendor from the database.
-
-    This function queries the database for all invoice IDs associated with the
-    specified vendor, then retrieves the full invoice details for each ID.
-    Invoices are returned in ascending order by invoice date.
-
-    Args:
-        vendor_name: The name of the vendor to search for.
-
-    Returns:
-        A list of invoice dictionaries. Each dictionary contains the complete
-        invoice information including invoice ID, vendor name, date, addresses,
-        totals, and line items. Returns an empty list if no invoices are found
-        or if the vendor does not exist.
-
-    Example:
-        invoices = get_invoices_by_vendor("SuperStore")
-        # Returns: [{"InvoiceId": "36259", "VendorName": "SuperStore", ...}, ...]
-    """
-    controller = InvoiceController()
-    invoice_ids = controller.get_invoices_by_vendor(vendor_name)
-
-    invoices = []
-    for inv_id in invoice_ids:
-        invoice = controller.get_invoice_by_id(inv_id)
-        if invoice:
-            invoice_dict = invoice.to_dict()
-            # Get items for this invoice
-            items = controller.get_items_by_invoice_id(inv_id)
-            invoice_dict["Items"] = [item.to_dict() for item in items]
-            invoices.append(invoice_dict)
-
-    return invoices
-
-
 @app.get("/invoices/{invoice_id}")
-def get_invoice_by_id(invoice_id: str) -> Optional[Dict[str, Any]]:
+def get_invoice_by_id(invoice_id: str, db: Session = Depends(get_db)) -> Optional[Dict[str, Any]]:
     """
     Retrieve a complete invoice by its ID, including line items.
 
@@ -328,7 +354,7 @@ def get_invoice_by_id(invoice_id: str) -> Optional[Dict[str, Any]]:
         # Returns: {"InvoiceId": "36259", "VendorName": "SuperStore", "Items": [...], ...}
     """
     controller = InvoiceController()
-    invoice = controller.get_invoice_by_id(invoice_id)
+    invoice = controller.get_invoice_by_id(invoice_id, db)
 
     if not invoice:
         raise HTTPException(
@@ -340,10 +366,29 @@ def get_invoice_by_id(invoice_id: str) -> Optional[Dict[str, Any]]:
     invoice_dict = invoice.to_dict()
 
     # Get items for this invoice
-    items = controller.get_items_by_invoice_id(invoice_id)
+    items = controller.get_items_by_invoice_id(invoice_id, db)
     invoice_dict["Items"] = [item.to_dict() for item in items]
 
     return invoice_dict
+
+
+@app.get("/databases")
+async def list_configured_databases():
+    """List all configured databases"""
+    databases = list_databases()
+    return {
+        "databases": databases,
+        "count": len(databases)
+    }
+
+
+# Example endpoint demonstrating multi-database usage
+# You can create endpoints that use specific databases like this:
+# @app.get("/analytics/stats")
+# async def get_analytics_stats(db: Session = Depends(get_db_by_name("analytics"))):
+#     # Query analytics database
+#     # result = db.query(AnalyticsModel).all()
+#     return {"message": "Query analytics database"}
 
 
 if __name__ == "__main__":

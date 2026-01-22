@@ -2,7 +2,8 @@ import unittest
 import os
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
-from db_util import init_db, save_inv_extraction, get_db, get_cursor
+from db import init_db, get_db, SessionLocal
+from db_util import save_inv_extraction
 from controllers.invoice_controller import InvoiceController
 from models.invoice import Invoice
 from models.item import Item
@@ -15,34 +16,79 @@ class TestInvoiceByIdAPI(unittest.TestCase):
         """Set up test fixtures before each test method"""
         # Set DB_BACKEND to sqlite for tests
         os.environ['DB_BACKEND'] = 'sqlite'
-        # Initialize database
-        init_db()
+        # Use shared in-memory database for tests (allows multiple connections)
+        self.test_engine = init_db("sqlite:///:memory:?cache=shared")
+        
+        # Capture the test database SessionLocal before app import
+        # Re-import to ensure we get the updated SessionLocal after init_db()
+        from db import SessionLocal as UpdatedSessionLocal
+        self.test_session_local = UpdatedSessionLocal
+        assert self.test_session_local is not None, "SessionLocal must be initialized"
+        assert self.test_engine is not None, "Engine must be initialized"
 
         # Import app
         with patch('oci.ai_document.AIServiceDocumentClient'), \
                 patch('oci.config.from_file', return_value={}):
             from app import app
+            
+            # Create a test-specific get_db function that uses the test database
+            def get_test_db():
+                db = self.test_session_local()
+                try:
+                    yield db
+                finally:
+                    db.close()
+            
+            app.dependency_overrides[get_db] = get_test_db
             self.client = TestClient(app)
+
+    def _setup_app_dependency_override(self, app):
+        """Helper method to set up dependency override for test database"""
+        # Ensure we have a valid SessionLocal and tables are created
+        if self.test_session_local is None or self.test_engine is None:
+            self.test_engine = init_db("sqlite:///:memory:?cache=shared")
+            from db import SessionLocal as UpdatedSessionLocal
+            self.test_session_local = UpdatedSessionLocal
+        
+        # Ensure tables exist for the test database
+        # Create tables using the engine bound to this sessionmaker
+        from db import Base
+        # Use the stored engine directly - it's bound to our sessionmaker
+        Base.metadata.create_all(bind=self.test_engine)
+        
+        # Note: TestClient(app) without context manager doesn't run startup events
+        # But we ensure tables exist anyway in case startup does run
+        
+        def get_test_db():
+            db = self.test_session_local()
+            try:
+                yield db
+            finally:
+                db.close()
+        app.dependency_overrides[get_db] = get_test_db
 
     def tearDown(self):
         """Clean up after each test"""
-        # Clean up test data using controller
-        controller = InvoiceController()
-        # Get all invoice IDs that start with TEST_
-        with get_db() as conn:
-            cursor = get_cursor(conn)
-            if os.getenv('DB_BACKEND', 'sqlite').lower() == 'postgresql':
-                cursor.execute("SELECT InvoiceId FROM invoices WHERE InvoiceId LIKE 'TEST_%'")
-                rows = cursor.fetchall()
-                invoice_ids = [row['InvoiceId'] for row in rows]
-            else:
-                cursor.execute("SELECT InvoiceId FROM invoices WHERE InvoiceId LIKE 'TEST_%'")
-                rows = cursor.fetchall()
-                invoice_ids = [row[0] for row in rows]
+        # Clear dependency overrides
+        from app import app
+        app.dependency_overrides.clear()
         
-        # Delete each test invoice using controller
-        for invoice_id in invoice_ids:
-            controller.delete_invoice(invoice_id)
+        # Clean up test data using SQLAlchemy (use test database directly)
+        db = self.test_session_local()
+        try:
+            from models.invoice import Invoice
+            test_invoices = db.query(Invoice).filter(
+                Invoice.invoice_id.like('TEST_%')
+            ).all()
+            invoice_ids = [inv.invoice_id for inv in test_invoices]
+
+            # Delete each test invoice using controller
+            controller = InvoiceController()
+            for invoice_id in invoice_ids:
+                controller.delete_invoice(invoice_id, db)
+            db.commit()
+        finally:
+            db.close()
 
     def test_get_invoice_by_id_success(self):
         """Test successful retrieval of invoice by ID"""
@@ -79,12 +125,18 @@ class TestInvoiceByIdAPI(unittest.TestCase):
                 "InvoiceTotal": 0.99
             }
         }
-        save_inv_extraction(test_data)
+        db = self.test_session_local()
+        try:
+            save_inv_extraction(test_data, db)
+            db.commit()
+        finally:
+            db.close()
 
         # Test GET endpoint
         with patch('oci.ai_document.AIServiceDocumentClient'), \
                 patch('oci.config.from_file', return_value={}):
             from app import app
+            self._setup_app_dependency_override(app)
             client = TestClient(app)
 
             response = client.get(f"/invoices/{test_invoice_id}")
@@ -112,6 +164,7 @@ class TestInvoiceByIdAPI(unittest.TestCase):
         with patch('oci.ai_document.AIServiceDocumentClient'), \
                 patch('oci.config.from_file', return_value={}):
             from app import app
+            self._setup_app_dependency_override(app)
             client = TestClient(app)
 
             response = client.get("/invoices/NONEXISTENT_99999")
@@ -159,11 +212,17 @@ class TestInvoiceByIdAPI(unittest.TestCase):
                 "InvoiceTotal": 0.99
             }
         }
-        save_inv_extraction(test_data)
+        db = self.test_session_local()
+        try:
+            save_inv_extraction(test_data, db)
+            db.commit()
+        finally:
+            db.close()
 
         with patch('oci.ai_document.AIServiceDocumentClient'), \
                 patch('oci.config.from_file', return_value={}):
             from app import app
+            self._setup_app_dependency_override(app)
             client = TestClient(app)
 
             response = client.get(f"/invoices/{test_invoice_id}")
@@ -200,11 +259,17 @@ class TestInvoiceByIdAPI(unittest.TestCase):
                 "InvoiceTotal": 0.99
             }
         }
-        save_inv_extraction(test_data)
+        db = self.test_session_local()
+        try:
+            save_inv_extraction(test_data, db)
+            db.commit()
+        finally:
+            db.close()
 
         with patch('oci.ai_document.AIServiceDocumentClient'), \
                 patch('oci.config.from_file', return_value={}):
             from app import app
+            self._setup_app_dependency_override(app)
             client = TestClient(app)
 
             response = client.get(f"/invoices/{test_invoice_id}")
@@ -220,22 +285,28 @@ class TestInvoiceByIdAPI(unittest.TestCase):
         test_invoice_id = "TEST_NULL_123"
 
         # Create invoice with null values using controller
-        controller = InvoiceController()
-        invoice = Invoice(
-            invoice_id=test_invoice_id,
-            vendor_name="NullVendor",
-            invoice_date="2012-03-06T00:00:00+00:00",
-            billing_address_recipient=None,  # Null BillingAddressRecipient
-            shipping_address=None,  # Null ShippingAddress
-            sub_total=100.0,
-            shipping_cost=None,  # Null ShippingCost
-            invoice_total=100.0
-        )
-        controller.create_or_update_invoice(invoice)
+        db = self.test_session_local()
+        try:
+            controller = InvoiceController()
+            invoice = Invoice(
+                invoice_id=test_invoice_id,
+                vendor_name="NullVendor",
+                invoice_date="2012-03-06T00:00:00+00:00",
+                billing_address_recipient=None,  # Null BillingAddressRecipient
+                shipping_address=None,  # Null ShippingAddress
+                sub_total=100.0,
+                shipping_cost=None,  # Null ShippingCost
+                invoice_total=100.0
+            )
+            controller.create_or_update_invoice(invoice, db)
+            db.commit()
+        finally:
+            db.close()
 
         with patch('oci.ai_document.AIServiceDocumentClient'), \
                 patch('oci.config.from_file', return_value={}):
             from app import app
+            self._setup_app_dependency_override(app)
             client = TestClient(app)
 
             response = client.get(f"/invoices/{test_invoice_id}")
@@ -272,11 +343,17 @@ class TestInvoiceByIdAPI(unittest.TestCase):
                 "InvoiceTotal": 0.99
             }
         }
-        save_inv_extraction(test_data)
+        db = self.test_session_local()
+        try:
+            save_inv_extraction(test_data, db)
+            db.commit()
+        finally:
+            db.close()
 
         with patch('oci.ai_document.AIServiceDocumentClient'), \
                 patch('oci.config.from_file', return_value={}):
             from app import app
+            self._setup_app_dependency_override(app)
             client = TestClient(app)
 
             response = client.get(f"/invoices/{test_invoice_id}")
@@ -290,6 +367,7 @@ class TestInvoiceByIdAPI(unittest.TestCase):
         with patch('oci.ai_document.AIServiceDocumentClient'), \
                 patch('oci.config.from_file', return_value={}):
             from app import app
+            self._setup_app_dependency_override(app)
             client = TestClient(app)
 
             response = client.get("/invoices/")
@@ -301,39 +379,45 @@ class TestInvoiceByIdAPI(unittest.TestCase):
         """Test that items are returned in correct order"""
         test_invoice_id = "TEST_ORDERED_123"
 
-        # Create invoice and items using controller
-        controller = InvoiceController()
-        invoice = Invoice(
-            invoice_id=test_invoice_id,
-            vendor_name="OrderedVendor",
-            invoice_date="2012-03-06T00:00:00+00:00",
-            billing_address_recipient="Test Recipient",
-            shipping_address="123 Test St",
-            sub_total=300.0,
-            shipping_cost=10.0,
-            invoice_total=310.0
-        )
-        controller.create_or_update_invoice(invoice)
-
-        # Insert items in specific order using controller
-        items_data = [
-            {"Description": "Item A", "Name": "Product A", "Quantity": 1, "UnitPrice": 100.0, "Amount": 100.0},
-            {"Description": "Item B", "Name": "Product B", "Quantity": 2, "UnitPrice": 100.0, "Amount": 200.0},
-        ]
-        for item_data in items_data:
-            item = Item(
+        # Create invoice and items using controller (use test database directly)
+        db = self.test_session_local()
+        try:
+            controller = InvoiceController()
+            invoice = Invoice(
                 invoice_id=test_invoice_id,
-                description=item_data["Description"],
-                name=item_data["Name"],
-                quantity=item_data["Quantity"],
-                unit_price=item_data["UnitPrice"],
-                amount=item_data["Amount"]
+                vendor_name="OrderedVendor",
+                invoice_date="2012-03-06T00:00:00+00:00",
+                billing_address_recipient="Test Recipient",
+                shipping_address="123 Test St",
+                sub_total=300.0,
+                shipping_cost=10.0,
+                invoice_total=310.0
             )
-            controller.create_item(item)
+            controller.create_or_update_invoice(invoice, db)
+
+            # Insert items in specific order using controller
+            items_data = [
+                {"Description": "Item A", "Name": "Product A", "Quantity": 1, "UnitPrice": 100.0, "Amount": 100.0},
+                {"Description": "Item B", "Name": "Product B", "Quantity": 2, "UnitPrice": 100.0, "Amount": 200.0},
+            ]
+            for item_data in items_data:
+                item = Item(
+                    invoice_id=test_invoice_id,
+                    description=item_data["Description"],
+                    name=item_data["Name"],
+                    quantity=item_data["Quantity"],
+                    unit_price=item_data["UnitPrice"],
+                    amount=item_data["Amount"]
+                )
+                controller.create_item(item, db)
+            db.commit()
+        finally:
+            db.close()
 
         with patch('oci.ai_document.AIServiceDocumentClient'), \
                 patch('oci.config.from_file', return_value={}):
             from app import app
+            self._setup_app_dependency_override(app)
             client = TestClient(app)
 
             response = client.get(f"/invoices/{test_invoice_id}")
@@ -378,11 +462,17 @@ class TestInvoiceByIdAPI(unittest.TestCase):
                 "InvoiceTotal": 0.99
             }
         }
-        save_inv_extraction(test_data)
+        db = self.test_session_local()
+        try:
+            save_inv_extraction(test_data, db)
+            db.commit()
+        finally:
+            db.close()
 
         with patch('oci.ai_document.AIServiceDocumentClient'), \
                 patch('oci.config.from_file', return_value={}):
             from app import app
+            self._setup_app_dependency_override(app)
             client = TestClient(app)
 
             response = client.get(f"/invoices/{test_invoice_id}")
